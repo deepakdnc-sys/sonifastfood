@@ -1,7 +1,7 @@
 
 /**
  * SONI FAST FOOD - Google Apps Script Backend
- * Version 2.1
+ * Version 2.3
  *
  * Public customer API:
  *  - getPublicConfig
@@ -191,16 +191,22 @@ function rows_(sh) {
 
 
 function settings_(ss) {
-  const rows = rows_(ss.getSheetByName('Settings'));
-
-  return Object.fromEntries(
-    rows.map(r => [
-      String(r.key).trim(),
-      String(r.value).trim()
-    ])
-  );
+  const sh = ss.getSheetByName('Settings');
+  if (!sh) throw Error('Settings sheet missing. Run setup().');
+  const values = sh.getDataRange().getValues();
+  const result = {};
+  const duplicates = [];
+  for (let i = 1; i < values.length; i++) {
+    const key = String(values[i][0] == null ? '' : values[i][0]).trim();
+    if (!key) continue;
+    if (Object.prototype.hasOwnProperty.call(result, key)) duplicates.push(key);
+    result[key] = String(values[i][1] == null ? '' : values[i][1]).trim();
+  }
+  if (duplicates.length) {
+    throw Error('Duplicate Settings keys: ' + [...new Set(duplicates)].join(', ') + '. Remove duplicate rows.');
+  }
+  return result;
 }
-
 
 /* =====================================
    3. BOOLEAN SETTINGS FIX
@@ -245,14 +251,24 @@ function reply_(data) {
 
 
 function doGet(e) {
-  return reply_({
-    ok: true,
-    service: 'SONI FAST FOOD API',
-    version: '2.1',
-    note: 'POST JSON for public requests'
-  });
+  try {
+    const ss = db_();
+    const s = settings_(ss);
+    return reply_({
+      ok: true,
+      service: 'SONI FAST FOOD API',
+      version: '3.0',
+      databaseConnected: true,
+      deliveryEnabled: isEnabled_(s.deliveryEnabled),
+      dineEnabled: isEnabled_(s.dineEnabled),
+      deliveryRawValue: String(s.deliveryEnabled == null ? '' : s.deliveryEnabled),
+      dineRawValue: String(s.dineEnabled == null ? '' : s.dineEnabled),
+      menuCount: menu_(ss).length
+    });
+  } catch (err) {
+    return reply_({ok: false, version: '3.0', error: String(err.message || err)});
+  }
 }
-
 
 function doPost(e) {
   try {
@@ -285,6 +301,12 @@ function doPost(e) {
 
       case 'createDineRequest':
         return reply_(createDine_(x));
+
+      case 'adminLogin': return reply_(adminLogin_(x));
+      case 'adminLogout': return reply_(adminLogout_(x));
+      case 'adminOrders': return reply_(adminOrders_(x));
+      case 'adminUpdateOrder': return reply_(adminUpdateOrder_(x));
+      case 'adminReport': return reply_(adminReport_(x));
 
       default:
         throw Error('Unknown public action');
@@ -435,7 +457,7 @@ function createDelivery_(x) {
     const ss = db_();
     const s = settings_(ss);
 
-    // FIX: Accept TRUE, true, True.
+    // Case-insensitive boolean setting.
     if (!isEnabled_(s.deliveryEnabled)) {
       throw Error('Home delivery is currently closed');
     }
@@ -701,7 +723,6 @@ function createDelivery_(x) {
     ];
 
     let orderWritten = false;
-    let itemsWritten = false;
     const changedStocks = [];
 
     try {
@@ -726,7 +747,6 @@ function createDelivery_(x) {
         6
       ).setValues(itemRows);
 
-      itemsWritten = true;
 
       for (const change of stockChanges) {
         menuSh.getRange(
@@ -1025,4 +1045,189 @@ function testPublicConfig() {
       2
     )
   );
+}
+
+
+/** Run from Apps Script editor, not exposed as a public action. */
+function diagnoseDelivery() {
+  const ss = db_();
+  const s = settings_(ss);
+  const result = {
+    version: '3.0',
+    databaseUrl: ss.getUrl(),
+    deliveryRawValue: s.deliveryEnabled,
+    deliveryEnabled: isEnabled_(s.deliveryEnabled),
+    dineRawValue: s.dineEnabled,
+    dineEnabled: isEnabled_(s.dineEnabled),
+    shopGpsConfigured: Boolean(s.shopLatitude && s.shopLongitude),
+    menuCount: menu_(ss).length
+  };
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+
+/* =====================================
+   13. OWNER ADMIN - SECURE SERVER API
+   Set OWNER_SETUP_PASSWORD in Script Properties,
+   then run initializeOwnerPassword() in editor.
+   Remove the property automatically after setup.
+===================================== */
+
+function hex_(bytes) {
+  return bytes.map(b => ('0' + (b & 255).toString(16)).slice(-2)).join('');
+}
+function digest_(text) {
+  return hex_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text));
+}
+function constantEqual_(a, b) {
+  a = String(a); b = String(b);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length,b.length); i++)
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return diff === 0;
+}
+function passwordHash_(password, salt) {
+  // Iterated salted SHA-256; use a strong, unique 16+ character password.
+  // Apps Script lacks a built-in password KDF; this is a pragmatic
+  // small-shop implementation, not a substitute for managed identity.
+  let h = salt + ':' + password;
+  for (let i = 0; i < 12000; i++) h = digest_(h + ':' + salt);
+  return h;
+}
+function initializeOwnerPassword() {
+  const p = PropertiesService.getScriptProperties();
+  const password = p.getProperty('OWNER_SETUP_PASSWORD');
+  if (!password || password.length < 16) throw Error('Set OWNER_SETUP_PASSWORD to 16+ characters in Script Properties first.');
+  if (p.getProperty('OWNER_PASSWORD_HASH')) throw Error('Password already configured. Run rotateOwnerPassword() for changes.');
+  const salt = Utilities.getUuid() + Utilities.getUuid();
+  p.setProperties({OWNER_PASSWORD_SALT:salt, OWNER_PASSWORD_HASH:passwordHash_(password,salt)});
+  p.deleteProperty('OWNER_SETUP_PASSWORD');
+  Logger.log('Owner password initialized. No password printed.');
+}
+function rotateOwnerPassword() {
+  const p = PropertiesService.getScriptProperties();
+  const password = p.getProperty('OWNER_SETUP_PASSWORD');
+  if (!password || password.length < 16) throw Error('Set a new 16+ character OWNER_SETUP_PASSWORD first.');
+  const salt = Utilities.getUuid() + Utilities.getUuid();
+  p.setProperties({OWNER_PASSWORD_SALT:salt, OWNER_PASSWORD_HASH:passwordHash_(password,salt)});
+  p.deleteProperty('OWNER_SETUP_PASSWORD');
+  // Old sessions remain valid for at most their cache lifetime; revoke
+  // sessions immediately by changing the session generation.
+  p.setProperty('OWNER_SESSION_GENERATION', Utilities.getUuid());
+  Logger.log('Owner password rotated and prior sessions revoked.');
+}
+function adminLogin_(x) {
+  const p = PropertiesService.getScriptProperties();
+  const salt = p.getProperty('OWNER_PASSWORD_SALT');
+  const expected = p.getProperty('OWNER_PASSWORD_HASH');
+  if (!salt || !expected) throw Error('Owner password is not initialized.');
+  const cache = CacheService.getScriptCache();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(25000);
+  try {
+    const attempts = Number(cache.get('owner_login_failures') || 0);
+    if (attempts >= 5) throw Error('Too many login attempts. Try again in 15 minutes.');
+    const supplied = String(x.password || '');
+    if (supplied.length > 256 || !constantEqual_(passwordHash_(supplied,salt),expected)) {
+      cache.put('owner_login_failures',String(attempts+1),900);
+      throw Error('Incorrect owner password');
+    }
+    cache.remove('owner_login_failures');
+    const token = Utilities.getUuid().replace(/-/g,'') + Utilities.getUuid().replace(/-/g,'');
+    const generation = p.getProperty('OWNER_SESSION_GENERATION') || 'initial';
+    cache.put('owner_session_' + digest_(token), generation, 21600);
+    return {ok:true,token,expiresInSeconds:21600};
+  } finally {lock.releaseLock();}
+}
+function requireOwner_(x) {
+  const token = String(x.token || '');
+  if (!/^[a-f0-9]{64}$/.test(token)) throw Error('Owner login required');
+  const actual = CacheService.getScriptCache().get('owner_session_' + digest_(token));
+  const generation = PropertiesService.getScriptProperties().getProperty('OWNER_SESSION_GENERATION') || 'initial';
+  if (!actual || !constantEqual_(actual,generation)) throw Error('Session expired. Please log in again.');
+}
+function adminLogout_(x) {
+  requireOwner_(x);
+  CacheService.getScriptCache().remove('owner_session_' + digest_(String(x.token)));
+  return {ok:true};
+}
+function adminOrders_(x) {
+  requireOwner_(x);
+  const ss=db_();
+  const all=rows_(ss.getSheetByName('DeliveryOrders'));
+  const itemRows=rows_(ss.getSheetByName('DeliveryOrderItems'));
+  const filter=String(x.status||'ALL').toUpperCase();
+  const result=all.filter(r=>filter==='ALL'||String(r.orderStatus).toUpperCase()===filter)
+    .slice(-200).reverse().map(r=>({
+      orderId:String(r.orderId),createdAt:String(r.createdAt),customerName:String(r.customerName),
+      mobile:String(r.mobile),address:String(r.address),landmark:String(r.landmark),
+      latitude:Number(r.latitude),longitude:Number(r.longitude),subtotal:Number(r.subtotal),
+      deliveryCharge:Number(r.deliveryCharge),total:Number(r.total),paymentMode:String(r.paymentMode),
+      paymentStatus:String(r.paymentStatus),orderStatus:String(r.orderStatus),
+      items:itemRows.filter(i=>String(i.orderId)===String(r.orderId)).map(i=>({name:String(i.name),quantity:Number(i.quantity),lineTotal:Number(i.lineTotal)}))
+    }));
+  return {ok:true,orders:result};
+}
+function adminUpdateOrder_(x) {
+  requireOwner_(x);
+  const lock=LockService.getScriptLock();lock.waitLock(25000);
+  try {
+    const ss=db_(),sh=ss.getSheetByName('DeliveryOrders');
+    const orderId=required_(x.orderId,100);
+    const data=sh.getDataRange().getValues();
+    const idx=data.findIndex((r,i)=>i>0&&String(r[0])===orderId);
+    if(idx<0)throw Error('Order not found');
+    const row=idx+1, current=String(data[idx][15]).toUpperCase();
+    const action=String(x.operation||'').toUpperCase();
+    const transitions={ACCEPT:['PLACED'],PREPARING:['ACCEPTED'],OUT_FOR_DELIVERY:['PREPARING'],DELIVERED:['OUT_FOR_DELIVERY'],REJECTED:['PLACED','ACCEPTED']};
+    const paymentActions=['MARK_PAID','MARK_UNPAID'];
+    if (!transitions[action]&&!paymentActions.includes(action))throw Error('Invalid owner operation');
+    if (transitions[action]&&!transitions[action].includes(current))throw Error('Cannot change '+current+' to '+action);
+    const now=new Date().toISOString();
+    if(action==='REJECTED') {
+      // Restore stock before marking rejected, under the same lock.
+      // Check item and stock rows first; partial Sheets failures require reconciliation.
+      const itemRows=rows_(ss.getSheetByName('DeliveryOrderItems')).filter(r=>String(r.orderId)===orderId);
+      const totals={};
+      itemRows.forEach(i=>totals[String(i.itemId)]=(totals[String(i.itemId)]||0)+Number(i.quantity));
+      const menuSh=ss.getSheetByName('Menu'),menuValues=menuSh.getDataRange().getValues();
+      const changes=Object.entries(totals).map(([id,qty])=>{
+        const m=menuValues.findIndex((r,i)=>i>0&&String(r[0])===id);
+        if(m<0||!Number.isFinite(qty)||qty<=0)throw Error('Cannot restore missing item: '+id);
+        return {row:m+1,old:Number(menuValues[m][7]),qty};
+      });
+      for(const c of changes)menuSh.getRange(c.row,8).setValue(c.old+c.qty);
+    }
+    if (transitions[action]) sh.getRange(row,16).setValue(action);
+    if (paymentActions.includes(action)) {
+      if(current==='REJECTED')throw Error('Cannot update payment for rejected order');
+      const mode=String(data[idx][13]);
+      const desired=action==='MARK_PAID'?'PAID':(mode==='COD'?'UNPAID':'PENDING_VERIFICATION');
+      sh.getRange(row,15).setValue(desired);
+    }
+    SpreadsheetApp.flush();
+    try{ss.getSheetByName('AuditLogs').appendRow([now,'OWNER_'+action,orderId,'Owner dashboard']);}catch(err){console.error(err);}
+    return {ok:true,orderId,orderStatus:transitions[action]?action:current};
+  } finally {lock.releaseLock();}
+}
+function adminReport_(x) {
+  requireOwner_(x);
+  const ss=db_(),all=rows_(ss.getSheetByName('DeliveryOrders'));
+  const from=String(x.from||'').trim(),to=String(x.to||'').trim();
+  if(from&&!/^\d{4}-\d{2}-\d{2}$/.test(from))throw Error('Invalid from date');
+  if(to&&!/^\d{4}-\d{2}-\d{2}$/.test(to))throw Error('Invalid to date');
+  const filtered=all.filter(r=>{
+    const date=Utilities.formatDate(new Date(r.createdAt),SFF.TZ,'yyyy-MM-dd');
+    return (!from||date>=from)&&(!to||date<=to);
+  });
+  const delivered=filtered.filter(r=>String(r.orderStatus)==='DELIVERED');
+  const paid=filtered.filter(r=>String(r.paymentStatus)==='PAID');
+  const realized=filtered.filter(r=>String(r.orderStatus)==='DELIVERED'&&String(r.paymentStatus)==='PAID');
+  const total=rows=>rows.reduce((sum,r)=>sum+Number(r.total||0),0);
+  const statuses={};filtered.forEach(r=>{const k=String(r.orderStatus);statuses[k]=(statuses[k]||0)+1;});
+  return {ok:true,report:{orders:filtered.length,delivered:delivered.length,rejected:statuses.REJECTED||0,
+    placedValue:total(filtered),deliveredValue:total(delivered),paymentsMarkedPaid:total(paid),
+    realizedSales:total(realized),unpaidDelivered:delivered.filter(r=>String(r.paymentStatus)!=='PAID').length,
+    byStatus:statuses,from,to}};
 }
